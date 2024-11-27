@@ -156,15 +156,6 @@ func (qm *QueueMan) UnFrameNewQueueRequest(reader io.Reader) (MQ, error) {
 }
 
 /*
-*    Byte[2:4] = Key Length [Context: 2 till 4 is the length of the key of the queue]
-*    Byte[4: 4 + Key_Length] = key/name [Context: Since the key length ends at 4th byte we start from 4th byte and go till the length of the key]
-*    Byte[4 + Key_Length] = mandatory   [Context: wherevere the key length eneded we can store the config values by adding 1 to it or 4 + length of the key till however long of a byte u want given its under the buff size we accuired]
-*    Byte[4 + Key_Length + 1] = immediate,
-*    Byte[4 + Key_Length + 2] = PersistentDeliveryMode [Context: "" same as above 1 + 1 = 2 ]
-*    Byte[4 + Key_Length + 3: 4 + Key_Length + 7] Data Length [Context same as above  1 + 1 + 1 = 3 + 4  + keylength + 3 + 4 [4 is the next 4 bytes that we are aquring to set the length of the data]= index of where we currently are]
-*    Byte[4 + Key_Length + 3 + 4 + Data Length]Data 1 + 1 + 1 =  [3 + 4] 7 + keylength : till however long the data is
- */
-/*
 *    Byte[0:2] = Type
 *    Byte[2:10] = TTL (Time-to-Live as time.Duration): 8 bytes
 *    Byte[10:34] = Message Created At (time.Time): 24 bytes
@@ -177,8 +168,8 @@ func (qm *QueueMan) UnFrameNewQueueRequest(reader io.Reader) (MQ, error) {
 *    Byte[36 + Key_Length + 7: end] = Data [Context: Actual message data, starting after data length]
  */
 func (qm *QueueMan) FrameIncommingMessage(name string, TTL time.Duration, createdAt time.Time, mandatory, immediate, PersistentDeliveryMode bool, data []byte) []byte {
-	TTL_LENGTH_IN_BYTES := 8
-	CREATED_AT_IN_BYTES := 24
+	TTL_LENGTH_IN_BYTES := 8  //time.duration
+	CREATED_AT_IN_BYTES := 24 //time.time
 	key := []byte(name)
 	if len(key) > 40 {
 		key = key[:40]
@@ -189,17 +180,28 @@ func (qm *QueueMan) FrameIncommingMessage(name string, TTL time.Duration, create
 		len(key) + //Key
 		3 + // (mandator) + (immediate)+ (PersistentDeliveryMode)
 		4 + // Data length
-		len(data) // data
+		len(data) + // data
+		TTL_LENGTH_IN_BYTES +
+		CREATED_AT_IN_BYTES
 
 	buff := make([]byte, totalLen)
+	binary.BigEndian.PutUint16(buff[0:2], uint16(IncommingMessage)) //set types
+	binary.BigEndian.PutUint64(buff[2:10], uint64(TTL))
+
+	wallTime := createdAt.Unix()
+	nanos := createdAt.Nanosecond()
+	binary.BigEndian.PutUint64(buff[10:18], uint64(wallTime))
+	binary.BigEndian.PutUint32(buff[18:22], uint32(nanos))
+	_, offset := createdAt.Zone()
+
+	binary.BigEndian.PutUint32(buff[22:26], uint32(offset))
 	Key_Length := len(key)
-	binary.BigEndian.PutUint16(buff[0:2], uint16(IncommingMessage)) //set bytes
 
-	binary.BigEndian.PutUint16(buff[2:4], uint16(len(key))) // set key length
+	binary.BigEndian.PutUint16(buff[34:36], uint16(len(key))) // set key length
 
-	copy(buff[4:4+Key_Length], key) //  copy key
+	copy(buff[36:36+Key_Length], key) //  copy key
 
-	flagOffset := 4 + Key_Length // its the index of where we left of after copying the key
+	flagOffset := 36 + Key_Length // its the index of where we left of after copying the key
 	buff[flagOffset] = 0
 	buff[flagOffset+1] = 0
 	buff[flagOffset+2] = 0
@@ -236,7 +238,15 @@ func (mq *QueueMan) UnFrameIncommingMessage(reader io.Reader) (Message, error) {
 	if messageType != uint16(IncommingMessage) {
 		return Message{}, fmt.Errorf("unexpected message type: %d (0x%x)", messageType, messageType)
 	}
-
+	ttlAndCreatedAtBuffer := make([]byte, 32)
+	if _, err := io.ReadFull(reader, ttlAndCreatedAtBuffer); err != nil {
+		return Message{}, fmt.Errorf("failed to ttl and created at: %v", err)
+	}
+	TTL := time.Duration(binary.BigEndian.Uint64(ttlAndCreatedAtBuffer[0:8]))
+	seconds := binary.BigEndian.Uint64(ttlAndCreatedAtBuffer[8:16])
+	nonos := binary.BigEndian.Uint32(ttlAndCreatedAtBuffer[16:20])
+	offSet := binary.BigEndian.Uint32(ttlAndCreatedAtBuffer[20:24])
+	createdAt := time.Unix(int64(seconds), int64(nonos)).In(time.FixedZone("", int(offSet)))
 	lenBuf := make([]byte, 2)
 	if _, err := io.ReadFull(reader, lenBuf); err != nil {
 		return Message{}, fmt.Errorf("failed to read key length: %v", err)
@@ -282,6 +292,8 @@ func (mq *QueueMan) UnFrameIncommingMessage(reader io.Reader) (Message, error) {
 
 	return Message{
 		Key:                    string(key),
+		TTL:                    TTL,
+		CreatedAt:              createdAt,
 		Mandatory:              mandatory,
 		Immediate:              immediate,
 		PersistentDeliveryMode: persistentDeliveryMode,
@@ -302,6 +314,8 @@ func (mq *QueueMan) HandleIncommingMessage(reader io.Reader) error {
 	fmt.Printf("Immediate: %v\n", msg.Immediate)
 	fmt.Printf("PersistentDeliveryMode: %v\n", msg.PersistentDeliveryMode)
 	fmt.Printf("Body: %s\n", string(msg.Body))
+	fmt.Printf("was created at: %v\n", msg.CreatedAt)
+	fmt.Printf("TTL is : %v\n", msg.TTL)
 
 	ch := mq.ConsumerChan[msg.Key]
 	ch <- msg
@@ -379,7 +393,7 @@ func (qm *QueueMan) Dial(addr string) (net.Conn, error) {
 	}
 	return conn, nil
 }
-func (mq *QueueMan) Produce(name string, mandatory, immidiate, PersistentDeliveryMode bool, data []byte) error {
+func (mq *QueueMan) Produce(name string, mandatory, immidiate, PersistentDeliveryMode bool, data []byte, ttl time.Duration, createdAt time.Time) error {
 	fmt.Printf("Producing Message - Debug Input:\n")
 	fmt.Printf("Queue Name: %s\n", name)
 	fmt.Printf("Mandatory: %v\n", mandatory)
@@ -387,7 +401,7 @@ func (mq *QueueMan) Produce(name string, mandatory, immidiate, PersistentDeliver
 	fmt.Printf("PersistentDeliveryMode: %v\n", PersistentDeliveryMode)
 	fmt.Printf("Data: %s\n", string(data))
 
-	IncommingMessageInbytes := mq.FrameIncommingMessage(name, mandatory, immidiate, PersistentDeliveryMode, data)
+	IncommingMessageInbytes := mq.FrameIncommingMessage(name, ttl, createdAt, mandatory, immidiate, PersistentDeliveryMode, data)
 
 	// Debug the framed bytes
 	fmt.Printf("Framed Message Bytes (Length: %d): %v\n", len(IncommingMessageInbytes), IncommingMessageInbytes)
@@ -473,7 +487,7 @@ func main() {
 
 	queueManager.RegisterConsumer("testqueue", consumerConn)
 
-	err = queueManager.Produce("testqueue", true, false, true, []byte("Hello, World!"))
+	err = queueManager.Produce("testqueue", true, false, true, []byte("Hello, World!"), time.Duration(time.Minute), time.Now())
 	if err != nil {
 		fmt.Println("Error producing message:", err)
 		return
