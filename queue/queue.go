@@ -7,25 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"sort"
 	"sync"
 	"time"
 )
 
-//!Priority Todo
-//! Identifier for consumer and producer should be sent as one of the args so we can set up listners for consumer to listen for the messages sent by producer via tcp
-
-// Todo Set up a listner it looks at how many messages it has a it keeps listning for em
-
-// * we set up a ticker that ticks every say 2 secs and what it also checks if the message queue length == 0 if if it is shut down the listner as soons the new message comes appead the message array and check if the listner is not already running if not start it so itll send the message to the consumer[✅]
-// * have a boot state that tells u that the listner thats reading from the queue is running or not[✅]!Done
-
-//Todo
-//* Consumer also have to create the queue with the same values that the producer used but if the queue for that name is already there return that queue else create
-
-// * Better errors
-// * current flow Producer -> Tcp -> ConsumerChan || What i want => Producer -> QueueMan -> ConsumerTcp -> ConsumerChan
 const DEFAULT_RUNTIME_FOR_CONSUMER_LISTNER_BEFORE_IT_SHUTS_DOWN = 5
 
 type QueueMan struct {
@@ -67,6 +55,8 @@ func NewConsumer(ConsumerId uint16, Conn net.Conn) Consumer {
 }
 
 type MQ struct {
+	RetryLimit      uint16
+	RetryDelay      time.Duration
 	ConsumerIdTrack uint16
 	Name            string
 	Durable         bool // Queue survives server restarts
@@ -75,18 +65,16 @@ type MQ struct {
 	NoWait          bool // Do not wait for a server response
 }
 
-func (qm *QueueMan) NewMQ(name string, isdurable, autoDelete, exclusive, noWait bool) MQ {
-	queue := MQ{
-		0,    //id
-		name, // name
-		isdurable,
-		autoDelete,
-		exclusive,
-		noWait,
-		// t, //! we'll get to this when im done with basic structure
+func (qm *QueueMan) NewMQ(name string, retryLimit uint16, retryDelay time.Duration, isDurable, autoDelete, exclusive, noWait bool) MQ {
+	return MQ{
+		Name:       name,
+		RetryLimit: retryLimit,
+		RetryDelay: retryDelay,
+		Durable:    isDurable,
+		AutoDelete: autoDelete,
+		Exclusive:  exclusive,
+		NoWait:     noWait,
 	}
-	qm.Queues[name] = queue
-	return queue
 }
 
 type Message struct {
@@ -102,45 +90,145 @@ type Message struct {
 	Priority  uint //! (1 - 3) 1 = low, 2 = mid, 3 = high i wanna make it more complex for now lets keep it simple
 }
 
+func (qm *QueueMan) NewMessage(key string, TTL time.Duration, createdAt time.Time, mandatory bool, Immediate bool, PersistentDeliveryMode bool, Body []byte, Priority uint, isProducer bool) Message {
+	return Message{
+		Id:                     qm.GenNewMessageId(),
+		isProducer:             isProducer,
+		Key:                    string(key),
+		TTL:                    TTL,
+		CreatedAt:              createdAt,
+		Mandatory:              mandatory,
+		Immediate:              Immediate,
+		PersistentDeliveryMode: PersistentDeliveryMode,
+		Body:                   Body,
+		Priority:               uint(Priority),
+	}
+}
+
 /*
 *New Queue frame
-!Byte 1 Message type
-!Byte 2 Padding
-!Byte 2 - 42 // Ill restrict the name to 40 bytes so 2 - 42 is the NAME
-!Byte 43 [IsDurable]
-!Byte 44 [AutoDelete]
-!Byte 45 [Exclusive]
-!Byte 46 [NoWait]
-*/
+* Frame Structure:
+* [0-1]   : Message Type (2 bytes, uint16)
+* [2-10]  : Retry Delay (8 bytes, uint64)
+* [10-12] : Retry Limit (2 bytes, uint16)
+* [12-14] : Queue Key Length (2 bytes, uint16)
+* [14:14 + Key Length] Data
+* [14 + Key Length:14 + Key Length ]   : Queue Key (variable length)
+*           - Durable Flag (1 byte)
+*           - Auto Delete Flag (1 byte)
+*           - Exclusive Flag (1 byte)
+*           - NoWait Flag (1 byte)
+ */
+// Parameters:
+//   - name: The name/key of the queue to be created
+//   - RetryLimit: Maximum number of retry attempts for queue creation
+//   - RetryDelay: Duration to wait between retry attempts
+//   - isDurable: Indicates if the queue should persist between server restarts
+//   - autoDelete: Determines if the queue should be automatically deleted when no longer in use
+//   - exclusive: Specifies if the queue is exclusive to the current connection
+//   - noWait: Indicates whether the method should wait for a response from the server
+//
+func (mq *QueueMan) FrameNewQueueRequest(name string, RetryLimit uint16, RetryDelay time.Duration, isDurable, autoDelete, exclusive, noWait bool) ([]byte, error) {
+	dataBuffLen :=
+		2 + //type bytes
+			10 + //RetryLimit + RetryDelay
+			4 + //isDurable + autoDelete + exclusive + noWait
+			2 + //KeyLen
+			len([]byte(name)) // name len
 
-func (mq *QueueMan) FrameNewQueueRequest(name string, isDurable, autoDelete, exclusive, noWait bool) ([]byte, error) {
-	dataBuffLen := 50
 	buff := make([]byte, dataBuffLen)
+
 	binary.BigEndian.PutUint16(buff[0:2], uint16(NewQueue))
-	fmt.Printf("whats being sent is %d\n", uint16(NewQueue))
-	copy(buff[2:42], name) // copy the name
+	KeyLen := len([]byte(name))
+	binary.BigEndian.PutUint64(buff[2:10], uint64(RetryDelay))
+	binary.BigEndian.PutUint16(buff[10:12], uint16(RetryLimit))
+	binary.BigEndian.PutUint16(buff[12:14], uint16(KeyLen))
+
+	copy(buff[14:14+KeyLen], []byte(name))
+	offset := 14 + KeyLen
 	if isDurable {
-		buff[43] = 1
+		buff[offset] = 1
 	} else {
-		buff[43] = 0
+		buff[offset] = 0
 	}
 	if autoDelete {
-		buff[44] = 1
+		buff[offset+1] = 1
 	} else {
-		buff[44] = 0
+		buff[offset+1] = 0
 	}
 	if exclusive {
-		buff[45] = 1
+		buff[offset+2] = 1
 	} else {
-		buff[45] = 0
+		buff[offset+2] = 0
 	}
 	if noWait {
-		buff[46] = 1
+		buff[offset+3] = 1
 	} else {
-		buff[46] = 0
+		buff[offset+3] = 0
 	}
 
 	return buff, nil
+}
+func (qm *QueueMan) UnFrameNewQueueRequest(reader io.Reader) (MQ, error) {
+	typeBuff := make([]byte, 2)
+	if _, err := io.ReadFull(reader, typeBuff); err != nil {
+		return MQ{}, fmt.Errorf("error reading the header %v", err)
+	}
+
+	RetryDelayBuff := make([]byte, 8)
+	if _, err := io.ReadFull(reader, RetryDelayBuff); err != nil {
+		return MQ{}, fmt.Errorf("error reading the header %v", err)
+	}
+	RetryDelay := time.Duration(binary.BigEndian.Uint64(RetryDelayBuff))
+	fmt.Printf("Max RetryDelay is %v\n", RetryDelay)
+
+	MaxRetriesBuff := make([]byte, 2)
+	if _, err := io.ReadFull(reader, MaxRetriesBuff); err != nil {
+		return MQ{}, fmt.Errorf("error reading the header %v", err)
+	}
+	MaxRetries := binary.BigEndian.Uint16(MaxRetriesBuff)
+	fmt.Printf("Max Retry is %d\n", MaxRetries)
+
+	KeyLenBuff := make([]byte, 2)
+	if _, err := io.ReadFull(reader, KeyLenBuff); err != nil {
+		return MQ{}, fmt.Errorf("error reading the header %v", err)
+	}
+	keyLen := binary.BigEndian.Uint16(KeyLenBuff)
+
+	keybuff := make([]byte, keyLen)
+	if _, err := io.ReadFull(reader, keybuff); err != nil {
+		return MQ{}, fmt.Errorf("error reading the header %v", err)
+	}
+	name := string(keybuff)
+
+	isDurableBuff := make([]byte, 1)
+	if _, err := io.ReadFull(reader, isDurableBuff); err != nil {
+		return MQ{}, fmt.Errorf("error reading the header %v", err)
+	}
+
+	AutoDeleteBuff := make([]byte, 1)
+	if _, err := io.ReadFull(reader, AutoDeleteBuff); err != nil {
+		return MQ{}, fmt.Errorf("error reading the header %v", err)
+	}
+
+	ExclusiveBuff := make([]byte, 1)
+	if _, err := io.ReadFull(reader, ExclusiveBuff); err != nil {
+		return MQ{}, fmt.Errorf("error reading the header %v", err)
+	}
+
+	NoWaitBuff := make([]byte, 1)
+	if _, err := io.ReadFull(reader, NoWaitBuff); err != nil {
+		return MQ{}, fmt.Errorf("error reading the header %v", err)
+	}
+
+	isDurable := isDurableBuff[0] == 1
+	AutoDelete := AutoDeleteBuff[0] == 1
+	Exclusive := ExclusiveBuff[0] == 1
+	NoWait := NoWaitBuff[0] == 1
+
+	q := qm.NewMQ(name, MaxRetries, RetryDelay, isDurable, AutoDelete, Exclusive, NoWait)
+
+	return q, nil
 }
 func LogMessageContents(msg Message) {
 	fmt.Println("Message successfully unframed:")
@@ -224,24 +312,6 @@ func (qm *QueueMan) SendToAllTheConsumersOfThisQueue(queueName string, conn net.
 	fmt.Printf("wrote %d bytes\n", n)
 
 	return nil
-}
-func (qm *QueueMan) UnFrameNewQueueRequest(reader io.Reader) (MQ, error) {
-	header := make([]byte, 47)
-	if _, err := io.ReadFull(reader, header); err != nil {
-		return MQ{}, fmt.Errorf("error reading the header %v", err)
-	}
-	MType := binary.BigEndian.Uint16(header[0:2])
-	fmt.Println(MType)
-	name := string(header[2:42])
-
-	isDurable := header[43] == 1
-	AutoDelete := header[44] == 1
-	Exclusive := header[45] == 1
-	NoWait := header[46] == 1
-
-	q := qm.NewMQ(name, isDurable, AutoDelete, Exclusive, NoWait)
-
-	return q, nil
 }
 
 /*
@@ -412,14 +482,12 @@ func (qm *QueueMan) UnFrameIncomingMessage(reader io.Reader) (Message, error) {
 	}
 	priority := binary.BigEndian.Uint16(prioritySizeByte)
 
-	// Read Data Length
 	lengthBuf := make([]byte, 4)
 	if _, err := io.ReadFull(reader, lengthBuf); err != nil {
 		return Message{}, fmt.Errorf("failed to read data length: %v", err)
 	}
 	dataLen := binary.BigEndian.Uint32(lengthBuf)
 
-	// Read Data
 	data := make([]byte, dataLen)
 	if _, err := io.ReadFull(reader, data); err != nil {
 		return Message{}, fmt.Errorf("failed to read data: %v", err)
@@ -437,7 +505,6 @@ func (qm *QueueMan) UnFrameIncomingMessage(reader io.Reader) (Message, error) {
 		Body:                   data,
 		Priority:               uint(priority),
 	}
-	LogMessageContents(m)
 	return m, nil
 }
 func (qm *QueueMan) RemoveMessage(id uint) {
@@ -468,7 +535,31 @@ func (mq *QueueMan) SendMessageToConsumerChan(ch chan Message, msg Message) erro
 	}
 	return nil
 }
-
+func (qm *QueueMan) HandleMessageFailSend(msg Message, reason error) error {
+	queue, exists := qm.Queues[msg.Key]
+	if !exists {
+		return fmt.Errorf("queue %s not found", msg.Key)
+	}
+	for retryCount := 0; retryCount < int(queue.RetryLimit); retryCount++ {
+		delay := queue.RetryDelay * time.Duration(math.Pow(2, float64(retryCount)))
+		time.Sleep(delay)
+		err := qm.Produce(msg.Key, msg.Mandatory, msg.Immediate, msg.PersistentDeliveryMode, msg.Body, msg.TTL, msg.CreatedAt, msg.Priority)
+		if err == nil {
+			return nil
+		}
+		log.Printf("Retry %d failed for message: %v", retryCount+1, err)
+	}
+	qm.MoveToDeadLetterQueue(msg, reason.Error())
+	return fmt.Errorf("all retries failed, message moved to dead letter queue")
+}
+func (qm *QueueMan) MoveToDeadLetterQueue(msg Message, reason string) {
+	dlqMessage := Message{
+		Key:       fmt.Sprintf("dlq_%s", msg.Key),
+		Body:      []byte(fmt.Sprintf("Original Message: %s, Failure Reason: %s", string(msg.Body), reason)),
+		CreatedAt: time.Now(),
+	}
+	qm.Produce(dlqMessage.Key, true, false, true, dlqMessage.Body, 24*time.Hour, dlqMessage.CreatedAt, msg.Priority)
+}
 func (mq *QueueMan) EjectMessageOnceTTLExpires(ttl time.Duration, msgId uint) error {
 	t := time.NewTicker(ttl)
 	defer t.Stop()
@@ -527,20 +618,21 @@ func (mq *QueueMan) handleListner(conn net.Conn) error {
 		}
 
 		mType := binary.BigEndian.Uint16(typeBuf)
-		//fmt.Printf("Received message type: %d (0x%x)\n", mType, mType)
-
 		isProducerBuf := make([]byte, 1)
-
+		isProducer := false
+		fmt.Printf("is producer %v\n", isProducer)
+		//fmt.Printf("Received message type: %d (0x%x)\n", mType, mType)
+		//since this isnt sent for new queue requests
 		_, err = io.ReadFull(reader, isProducerBuf)
 		if err != nil {
 			return err
 		}
 		resetBytes := append(typeBuf, isProducerBuf...)
-		reader = bufio.NewReader(io.MultiReader(bytes.NewReader(resetBytes), reader))
-		isProducer := isProducerBuf[0] != 0
-		fmt.Printf("is producer %v\n", isProducer)
-		if !isProducer {
+		reader = bufio.NewReader(io.MultiReader(bytes.NewReader(resetBytes), reader)) // reset for typeBuff length and isProducerBuf length
+		isProducer = isProducerBuf[0] != 0
 
+		//reader = bufio.NewReader(io.MultiReader(bytes.NewReader(typeBuf), reader)) // reset for typeBuff length
+		if !isProducer {
 			msg, err := mq.UnFrameIncomingMessage(reader)
 			if err != nil {
 				return fmt.Errorf("error trying to unframe New Queue Request: %v", err)
@@ -564,10 +656,11 @@ func (mq *QueueMan) handleListner(conn net.Conn) error {
 			switch TransportType(mType) {
 			case NewQueue:
 				fmt.Println("Handling New Queue Request")
-				_, err := mq.UnFrameNewQueueRequest(reader)
+				q, err := mq.UnFrameNewQueueRequest(reader)
 				if err != nil {
 					return fmt.Errorf("error trying to unframe New Queue Request: %v", err)
 				}
+				mq.Queues[q.Name] = q
 			case IncommingMessage:
 				fmt.Println("Handling Incoming Message")
 				err := mq.HandleIncommingMessage(reader)
@@ -599,9 +692,6 @@ func (mq *QueueMan) SetUpListenerForConsumer(conn net.Conn, queueName string, st
 		fmt.Printf("im running for queue %s\n", queueName)
 		msg, err := mq.UnFrameIncomingMessage(reader)
 
-		LogMessageContents(msg)
-		fmt.Printf("im after the message unframe %s\n", queueName)
-
 		if err != nil {
 			if err == io.EOF {
 				return nil
@@ -630,8 +720,8 @@ func (mq *QueueMan) RegisterConsumer(QueueName string, ConsumerConn net.Conn) {
 	}()
 }
 
-func (mq *QueueMan) RegisterProducer(name string, Durable, AutoDelete, Exclusive, NoWait bool) {
-	queueData, err := mq.FrameNewQueueRequest(name, Durable, AutoDelete, Exclusive, NoWait)
+func (mq *QueueMan) RegisterProducer(name string, Durable, AutoDelete, Exclusive, NoWait bool, maxRetry uint, RetryDelay time.Duration) {
+	queueData, err := mq.FrameNewQueueRequest(name, uint16(maxRetry), RetryDelay, Durable, AutoDelete, Exclusive, NoWait)
 
 	mq.ErrorMustNotBeThere(err)
 	mq.TryDeliverToBroker(queueData)
@@ -648,21 +738,16 @@ func (qm *QueueMan) Dial(addr string) (net.Conn, error) {
 	}
 	return conn, nil
 }
-func (mq *QueueMan) Produce(name string, mandatory, immidiate, PersistentDeliveryMode bool, data []byte, ttl time.Duration, createdAt time.Time) error {
-
+func (mq *QueueMan) Produce(name string, mandatory, immidiate, PersistentDeliveryMode bool, data []byte, ttl time.Duration, createdAt time.Time, priority uint) error {
 	IncommingMessageInbytes := mq.FrameIncomingMessage(name, true, ttl, createdAt, mandatory, immidiate, PersistentDeliveryMode, data)
-
 	fmt.Printf("Framed Message Bytes (Length: %d): %v\n", len(IncommingMessageInbytes), IncommingMessageInbytes)
-
 	err := mq.TryDeliverToBroker(IncommingMessageInbytes)
+	if err != nil {
+		m := mq.NewMessage(name, ttl, createdAt, mandatory, immidiate, PersistentDeliveryMode, data, priority, true)
+		mq.HandleMessageFailSend(m, err)
+	}
 	return err
 }
-
-// To Test
-// start the server
-// register the producer by creating a queue by calling RegisterProducer
-// register the consumer by calling RegisterConsumer
-// consume by reading from the chan thats returned by consume func
 
 func (mq *QueueMan) Start() error {
 	address := fmt.Sprintf(":%d", mq.Port)
@@ -749,7 +834,7 @@ func main() {
 	default:
 	}
 
-	queueManager.RegisterProducer("testqueue", true, false, false, false)
+	queueManager.RegisterProducer("testqueue", true, false, false, false, 3, 2*time.Second)
 
 	consumerConn, err := net.Dial("tcp4", "localhost:8081")
 	if err != nil {
@@ -760,7 +845,7 @@ func main() {
 
 	queueManager.RegisterConsumer("testqueue", consumerConn)
 
-	err = queueManager.Produce("testqueue", true, false, true, []byte("Hello, World!"), time.Duration(time.Minute)*10, time.Now())
+	err = queueManager.Produce("testqueue", true, false, true, []byte("Hello, World!"), time.Duration(time.Millisecond)*1, time.Now(), 3)
 	if err != nil {
 		fmt.Println("Error producing message:", err)
 		return

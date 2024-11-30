@@ -1,0 +1,7 @@
+ERROR: 2024/11/29 10:51:04 main.go:90: [%!s(main.ErrorCode=3)] Example 1: Simulating an error: network timeout occurred
+goroutine 1 [running]:
+main.Wrap({0x104a82208, 0x1400008e080}, {0x104a4349a, 0x1e}, 0x3)
+	/Users/rahul07/Q/main.go:75 +0x64
+main.main()
+	/Users/rahul07/Q/main.go:180 +0xc0
+
